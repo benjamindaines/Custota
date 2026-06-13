@@ -113,7 +113,7 @@ val gitVersionTriple = describeVersion(git)
 val gitVersionCode = getVersionCode(gitVersionTriple)
 val gitVersionName = getVersionName(git, gitVersionTriple)
 
-val projectUrl = "https://github.com/chenxiaolong/Custota"
+val projectUrl = "https://github.com/benjamindaines/BenOS-OTA-Updater"
 val releaseMetadataBranch = "master"
 
 val extraDir = layout.buildDirectory.map { it.dir("extra") }
@@ -127,7 +127,7 @@ android {
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "com.chiller3.custota"
+        applicationId = "ph.dgsd.Custota"
         minSdk = 33
         targetSdk = 36
         versionCode = gitVersionCode
