@@ -145,6 +145,27 @@ class NeoBackupEngine(
     }
 
     private fun backupApks(appInfo: ApplicationInfo, instanceDir: File): Boolean {
+        val sourceDir = appInfo.sourceDir ?: return false
+        if (!sourceDir.startsWith("/data/")) {
+            Log.i(TAG, "Preinstalled APK survives the OTA; skipping capture ($sourceDir)")
+            return false  
+        }
+        val apks = buildList { add(sourceDir); appInfo.splitSourceDirs?.forEach { add(it) } }
+        var any = false
+        for (apk in apks) {
+            try {
+                File(instanceDir, File(apk).name).outputStream().use { fs.readFile(apk, it) }
+                any = true
+            } catch (e: Throwable) {
+                Log.w(TAG, "Skipping APK $apk: ${e.message}")
+            }
+        }
+        return any
+    }
+
+
+    /**
+    private fun backupApks(appInfo: ApplicationInfo, instanceDir: File): Boolean {
         val apks = buildList {
             appInfo.sourceDir?.let { add(it) }
             appInfo.splitSourceDirs?.forEach { add(it) }
@@ -158,6 +179,7 @@ class NeoBackupEngine(
         }
         return true
     }
+    */
 
     /**
      * Tar up [sourcePath]'s contents into <type>.tar[.zst][.enc] in [instanceDir].
@@ -187,24 +209,31 @@ class NeoBackupEngine(
             type, BackupConfig.COMPRESS, BackupConfig.COMPRESSION_TYPE, BackupConfig.ENCRYPT,
         )
         val outFile = File(instanceDir, filename)
-
-        outFile.outputStream().use { rawOut ->
-            val wrapped: OutputStream = BackupCrypto.wrapArchiveStream(
-                rawOut,
-                compress = BackupConfig.COMPRESS,
-                compressionType = BackupConfig.COMPRESSION_TYPE,
-                compressionLevel = BackupConfig.COMPRESSION_LEVEL,
-                encrypt = BackupConfig.ENCRYPT,
-                password = BackupConfig.ENCRYPTION_PASSWORD.ifEmpty { null },
-                salt = salt,
-                iv = iv,
-            )
-            TarArchiveOutputStream(wrapped).use { tar ->
-                tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
-                writeEntries(tar, sourcePath, filtered)
+	return try {
+		val nodes = fs.list(sourcePath)
+		val filtered = applyExclusions(nodes, topLevel)
+		if (filtered.isEmpty()) return false
+        	outFile.outputStream().use { rawOut ->
+            	    val wrapped: OutputStream = BackupCrypto.wrapArchiveStream(
+                	rawOut,
+               		compress = BackupConfig.COMPRESS,
+                	compressionType = BackupConfig.COMPRESSION_TYPE,
+                	compressionLevel = BackupConfig.COMPRESSION_LEVEL,
+                	encrypt = BackupConfig.ENCRYPT,
+                	password = BackupConfig.ENCRYPTION_PASSWORD.ifEmpty { null },
+                	salt = salt,
+                	iv = iv,
+            	)
+                TarArchiveOutputStream(wrapped).use { tar ->
+                    tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
+                    writeEntries(tar, sourcePath, filtered)
+                }
             }
-        }
-        return true
+            true
+        } catch (e: Throwable) {
+		Log.w(TAG, "Tree $type at $sourcePath failed: ${e.message}")
+		false
+	  }
     }
 
     /** Mirrors Neo-Backup TarUtils.suAddFiles, sourcing bytes from benbackupd. */
