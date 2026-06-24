@@ -29,6 +29,7 @@ import java.io.File
 import java.io.OutputStream
 import java.time.LocalDateTime
 import java.util.Date
+import com.chiller3.custota.updater.PackageConflictConfig
 
 class NeoBackupEngine(
     private val context: Context,
@@ -113,7 +114,7 @@ class NeoBackupEngine(
                 profileId = userId,
                 sourceDir = appInfo.sourceDir,
                 splitSourceDirs = appInfo.splitSourceDirs ?: arrayOf(),
-                isSystem = (appInfo.flags and
+                isSystem = packageName in PackageConflictConfig.IS_SYSTEM || (appInfo.flags and
                         (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0,
                 backupDate = now,
                 hasApk = hasApk,
@@ -130,8 +131,9 @@ class NeoBackupEngine(
                 size = size,
             )
 
-            File(instanceDir, NeoBackupFormat.BACKUP_INSTANCE_PROPERTIES_INDIR)
-                .writeText(props.toSerialized())
+//            File(instanceDir, NeoBackupFormat.BACKUP_INSTANCE_PROPERTIES_INDIR)
+            val propsFile = File(pkgDir, "$instanceName.properties")
+            propsFile.writeText(props.toSerialized())
 
             Log.i(TAG, "Backed up $packageName -> $instanceDir (${size} bytes)")
             instanceDir

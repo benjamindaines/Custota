@@ -114,7 +114,7 @@ struct UpdateInfo {
     /// `#[serde(default)]` keeps older files that predate this field readable.
     #[serde(default)]
     timestamp: i64,
-    backup_apps: String,
+    backupApps: Vec<String>,
     full: Option<LocationInfo>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     incremental: HashMap<String, LocationInfo>,
@@ -761,9 +761,11 @@ fn subcommand_gen_update_info(args: &GenerateUpdateInfo) -> Result<()> {
         .trim()
         .parse::<i64>()?;
     
-    update_info.backup_apps = fs::read_to_string(".backupApps")?
-        .trim()
-        .parse::<String>()?;
+    update_info.backupApps = fs::read_to_string(".backupApps")?
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     
 //        .duration_since(UNIX_EPOCH)
 //        .context("System time is before the Unix epoch")?

@@ -23,7 +23,7 @@ object BackupConfig {
 
     // --- compression (matches Neo-Backup) --------------------------------
     const val COMPRESS = true
-    const val COMPRESSION_TYPE = "zst"           // "zst" | "gz" | "no" NOTE: zst is broken currently 
+    const val COMPRESSION_TYPE = "gz"           // "zst" | "gz" | "no" NOTE: zst is broken currently 
     const val COMPRESSION_LEVEL = 3              // Neo-Backup default-ish
 
     // --- exclusions (match / slightly tighten Neo-Backup) ----------------
