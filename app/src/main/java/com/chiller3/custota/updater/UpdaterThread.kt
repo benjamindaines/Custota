@@ -69,8 +69,6 @@ class UpdaterThread(
         
     private val backupEngine = NeoBackupEngine(context)
     
-    private val backupPackages = emptyList<String>()
-
     // If we crash and restart while paused, the user will need to pause and unpause to resume
     // because update_engine does not report the pause state.
     var isPaused: Boolean = false
@@ -826,9 +824,9 @@ class UpdaterThread(
             }
         } else {
             
-            backupPackages.forEach { packageName ->
-                    backupEngine.backup(packageName)
-                }
+            //backupPackages.forEach { packageName ->
+             //       backupEngine.backup(packageName)
+              //  }
             
             updateEngine.applyPayload(
                 otaUri.toString(),
@@ -888,8 +886,9 @@ class UpdaterThread(
      * Failures here must never block or fail the (already successful) update flow, so all errors
      * are caught and logged.
      */
-    private fun resolvePackageConflicts() {
-        try {
+    private fun resolvePackageConflicts(backupPackages: List<String>) {
+ 	backupPackages.forEach { backupEngine.backup(it) }
+       try {
             Log.d(TAG, "Running package conflict resolution before reboot")
             val removed = PackageConflictResolver(context).resolveConflicts()
             if (removed.isNotEmpty()) {
@@ -935,15 +934,20 @@ class UpdaterThread(
                     listener.onUpdateResult(this, UpdateFailed(newStatusStr))
                 }
             } else if (status == UpdateEngineStatus.UPDATED_NEED_REBOOT) {
-                // The engine is already pending reboot from a previous run. Resolve any package
-                // conflicts before reminding the user to reboot, in case it wasn't done already.
-               // backupEngine.backup("com.google.android.apps.messaging")
-                resolvePackageConflicts()
+              
+		// Already would have run backup & resolve upon the completion of the update... this is redundant. 
+	       
+            //	backupPackages.forEach { packageName ->
+            //        backupEngine.backup(packageName)
+            //   	 }
+            
+	     //  	resolvePackageConflicts()
 
                 // Resend success notification to remind the user to reboot. We can't perform any
                 // further operations besides reverting.
                 listener.onUpdateResult(this, UpdateNeedReboot)
             } else {
+		var backupPackages: List<String> = emptyList()
                 if (status == UpdateEngineStatus.IDLE) {
                     if (action == Action.MONITOR) {
                         // Nothing to do.
@@ -979,7 +983,8 @@ class UpdaterThread(
                     listener.onUpdateProgress(this, ProgressType.UPDATE, 0, 0)
 
 		   // backupEngine.backup("com.google.android.apps.messaging")
-                    
+                   
+		    backupPackages = checkUpdateResult.backupPackages
                  
                     startInstallation(
                         checkUpdateResult.otaUri,
@@ -1008,7 +1013,9 @@ class UpdaterThread(
                         // booted on the old slot, so any conflicting user-installed app is still an
                         // ordinary /data/app package and can be cleanly uninstalled here, before the
                         // user is prompted to reboot into the new slot.
-//                        resolvePackageConflicts()
+                        //resolvePackageConflicts(
+ 
+       	       		resolvePackageConflicts(backupPackages)
 
                         listener.onUpdateResult(this, UpdateSucceeded)
                     }
