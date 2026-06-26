@@ -315,6 +315,15 @@ class UpdaterService : Service(), UpdaterThread.UpdaterThreadListener {
                 showRetry = true
                 showReboot = false
             }
+            is UpdaterThread.UpdateFailedConflicts -> {
+                channel = Notifications.CHANNEL_ID_FAILURE
+                onlyAlertOnce = false
+                titleResId = R.string.notification_update_ota_failed_conflicts
+                message = result.packages.joinToString("\n")
+                showInstall = false
+                showRetry = true
+                showReboot = false
+            }
             UpdaterThread.BrokenNetworkApi -> {
                 channel = Notifications.CHANNEL_ID_FAILURE
                 onlyAlertOnce = false

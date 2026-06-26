@@ -500,6 +500,101 @@ class UpdaterThread(
         return csigInfo
     }
 
+    /**
+     * Fetch the signed remote rules file, CMS-verify it against the pinned BenOS
+     * rules key, extract the JSON, and partition it into the capture and conflict
+     * lanes.
+     *
+     * Fail closed: any failure — unreachable, malformed, unverified, or no pinned
+     * key — returns [ResolvedRules.EMPTY], so the conflict lane falls back to the
+     * hard-coded [PackageConflictConfig] floor and the capture lane is empty. The
+     * device never acts on an unsigned or unverified rules blob.
+     */
+    private fun fetchAndPartitionRules(romTimestamp: Long?, otaTimestamp: Long?): ResolvedRules {
+        return try {
+            val publicKey = RulesConfig.publicKey
+                ?: throw ValidationException("No pinned BenOS rules key available")
+
+            val rulesRaw = openUrl(URL(RulesConfig.RULES_URL)) { it.inputStream }
+                .use { it.readBytes() }
+
+            val cms = CMSSignedData(rulesRaw)
+
+            // Verify against the pinned key only — never against any certificate
+            // that may be carried inside the blob.
+            val verified = cms.signerInfos.any { signerInfo ->
+                try {
+                    signerInfo.verify(JcaSimpleSignerInfoVerifierBuilder().build(publicKey))
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            if (!verified) {
+                throw ValidationException("Rules file is not signed by the pinned BenOS rules key")
+            }
+
+            val json = String(cms.signedContent.content as ByteArray, Charsets.UTF_8)
+            val rulesFile: RulesFile = JSON_FORMAT.decodeFromString(json)
+
+            if (rulesFile.version != 1) {
+                throw BadFormatException("Only rules version 1 is supported")
+            }
+
+            val capture = mutableListOf<String>()
+            val conflict = mutableListOf<String>()
+            for (rule in rulesFile.rules) {
+                if (!ruleInEffect(rule, romTimestamp, otaTimestamp)) {
+                    continue
+                }
+                when (rule.action) {
+                    "capture" -> capture.add(rule.pkg)
+                    "conflict" -> conflict.add(rule.pkg)
+                    else -> Log.w(TAG, "Ignoring rule with unknown action: ${rule.action}")
+                }
+            }
+
+            Log.d(TAG, "Rules: ${capture.size} capture, ${conflict.size} conflict")
+            ResolvedRules(capture.distinct(), conflict.distinct())
+        } catch (e: Exception) {
+            Log.w(TAG, "Rules unavailable; failing closed to the hard-coded floor", e)
+            ResolvedRules.EMPTY
+        }
+    }
+
+    /**
+     * Decide whether a rule applies to the update currently being installed, given
+     * the running ROM's build timestamp [romTimestamp] (`ro.benos_timestamp`) and
+     * the destination build's timestamp [otaTimestamp] (`updateInfo.timestamp`). All
+     * three are UTC epoch seconds derived from the same build-time value.
+     *
+     *  - Out of scope (rule timestamp > destination): skipped, so rules belonging to
+     *    builds beyond the destination — e.g. a pre-release branch published in the
+     *    same rules file — never run on a stable install.
+     *  - oneshot: fires only on the update that crosses its timestamp, i.e.
+     *    `romTimestamp < ruleTs <= otaTimestamp`, so it runs exactly once — even if
+     *    the build that introduced it was skipped over in a single larger jump.
+     *  - standing (oneshot = false): fires on every update once in scope.
+     *
+     * A rule without a timestamp (or when a timestamp is unavailable) falls back to
+     * firing — prior ungated behavior — rather than being silently dropped.
+     */
+    private fun ruleInEffect(rule: RuleEntry, romTimestamp: Long?, otaTimestamp: Long?): Boolean {
+        val ruleTs = rule.timestamp ?: return true
+
+        // Stop at the destination: ignore rules from builds beyond where we're going.
+        if (otaTimestamp != null && ruleTs > otaTimestamp) {
+            return false
+        }
+
+        return if (rule.oneshot) {
+            // Fire only while crossing the rule's build; once the running ROM has
+            // reached or passed it, never fire again.
+            romTimestamp == null || romTimestamp < ruleTs
+        } else {
+            true
+        }
+    }
+
     /** Fetch the OTA metadata and validate that the update is valid for the current system. */
     private fun fetchAndCheckMetadata(
         uri: Uri,
@@ -652,6 +747,17 @@ class UpdaterThread(
         val pfMetadata = csigInfo.getOrThrow(OtaPaths.METADATA_NAME)
         val metadata = fetchAndCheckMetadata(otaUri, pfMetadata, csigInfo)
 
+        // The signed csig and the (unsigned) descriptor both carry this build's
+        // timestamp; require them to agree. The rules window and the up-to-date /
+        // no-downgrade gate both key off this value, so anchoring it to the signed
+        // csig means the unsigned descriptor can't be tampered with undetected.
+        if (csigInfo.timestamp != null && updateInfo.timestamp != null &&
+            csigInfo.timestamp != updateInfo.timestamp) {
+            throw ValidationException(
+                "csig timestamp (${csigInfo.timestamp}) does not match descriptor " +
+                    "timestamp (${updateInfo.timestamp})")
+        }
+
         if (metadata.postcondition.buildList.isEmpty()) {
             throw ValidationException("Metadata postcondition lists no fingerprints")
         }
@@ -665,7 +771,12 @@ class UpdaterThread(
             Log.d(TAG, "OTA vbmeta digest: ${csigInfo.vbmetaDigest}")
             updateAvailable = csigInfo.vbmetaDigest != vbmetaDigest
         }
-        val backupPackages = updateInfo.backupApps
+        // Pull the signed remote rules each update check and partition them into the
+        // capture and conflict lanes, gated by the timestamp window between the
+        // running ROM and the destination build. The destination comes from the
+        // signed csig (falling back to the descriptor only if an older csig lacks
+        // it). Fail-closed to empty (-> floor).
+        val rules = fetchAndPartitionRules(romTimestamp, csigInfo.timestamp ?: updateInfo.timestamp)
         
         // If the running ROM's build timestamp is newer than the timestamp of the
         // published OTA, the device is already up to date and must not "update" to
@@ -727,7 +838,7 @@ class UpdaterThread(
             otaUri,
             csigInfo,
             message,
-            backupPackages,
+            rules,
         )
     }
 
@@ -758,7 +869,7 @@ class UpdaterThread(
     }
 
     /** Asynchronously trigger the update_engine payload application. */
-    private fun startInstallation(otaUri: Uri, csigInfo: CsigInfo, backupPackages: List<String>) {
+    private fun startInstallation(otaUri: Uri, csigInfo: CsigInfo) {
         val pfPayload = csigInfo.getOrThrow(OtaPaths.PAYLOAD_NAME)
         val pfPayloadMetadata = csigInfo.getOrThrow(OtaPaths.PAYLOAD_METADATA_NAME)
         val pfPayloadProperties = csigInfo.getOrThrow(OtaPaths.PAYLOAD_PROPERTIES_NAME)
@@ -823,11 +934,6 @@ class UpdaterThread(
                 )
             }
         } else {
-            
-            //backupPackages.forEach { packageName ->
-             //       backupEngine.backup(packageName)
-              //  }
-            
             updateEngine.applyPayload(
                 otaUri.toString(),
                 pfPayload.offset,
@@ -886,16 +992,87 @@ class UpdaterThread(
      * Failures here must never block or fail the (already successful) update flow, so all errors
      * are caught and logged.
      */
-    private fun resolvePackageConflicts(backupPackages: List<String>) {
- 	backupPackages.forEach { backupEngine.backup(it) }
-       try {
-            Log.d(TAG, "Running package conflict resolution before reboot")
-            val removed = PackageConflictResolver(context).resolveConflicts()
-            if (removed.isNotEmpty()) {
-                Log.i(TAG, "Removed conflicting packages before reboot: $removed")
+    /**
+     * Unstage a freshly-applied update so the device boots the old slot again, and
+     * return the engine status once it has left [UpdateEngineStatus.UPDATED_NEED_REBOOT].
+     * This is the single revert primitive shared by the [Action.REVERT] flow and
+     * the post-update conflict guard.
+     */
+    private fun revertStagedUpdate(): Int {
+        Log.d(TAG, "Reverting staged update via engine reset")
+        updateEngine.resetStatus()
+        return waitForStatus { it != UpdateEngineStatus.UPDATED_NEED_REBOOT }
+    }
+
+    /**
+     * Capture and conflict handling, run once the engine has staged the new slot
+     * and before the user is prompted to reboot (still booted on the old slot, so
+     * a conflicting app is still an ordinary user package that can be cleanly
+     * uninstalled).
+     *
+     * Capture lane: back up every package the rules mark `capture`. These are
+     * never uninstalled, so a backup failure is logged and we continue.
+     *
+     * Conflict lane: the hard-coded floor unioned with the rules' `conflict`
+     * packages, each gated by the resolver's system-app + signature checks. Every
+     * conflict is backed up immediately before it is uninstalled; if the backup
+     * fails, the app is left in place. A shared [captureOnce] set ensures an app in
+     * both lanes is backed up exactly once.
+     *
+     * Returns the conflicts that could NOT be removed ("blockers"). A non-empty
+     * result tells the caller to revert the staged update, because a leftover
+     * conflicting app would bootloop the new slot. Removed apps were backed up
+     * first, so after a revert the user can restore them with the bundled NeoBackup.
+     */
+    private fun resolvePackageConflicts(rules: ResolvedRules): List<String> {
+        val captureOnce = mutableSetOf<String>()
+
+        // Capture lane. backup() never throws (it returns null on failure), so a
+        // failure is just logged; it never blocks the update.
+        for (pkg in rules.captureList) {
+            if (pkg in captureOnce) {
+                continue
             }
+            if (backupEngine.backup(pkg) != null) {
+                captureOnce.add(pkg)
+            } else {
+                Log.w(TAG, "Capture-lane backup failed for $pkg; continuing")
+            }
+        }
+
+        // Conflict lane.
+        return try {
+            val conflictPackages =
+                (PackageConflictConfig.PACKAGE_NAMES + rules.conflictExtra).distinct()
+
+            val result = PackageConflictResolver(context).resolveConflicts(
+                conflictPackages,
+            ) onBeforeUninstall@{ pkg ->
+                if (pkg in captureOnce) {
+                    // Already backed up this cycle (capture lane or an earlier conflict).
+                    return@onBeforeUninstall true
+                }
+                val backedUp = backupEngine.backup(pkg) != null
+                if (backedUp) {
+                    captureOnce.add(pkg)
+                } else {
+                    Log.w(TAG, "Backup before uninstall failed for $pkg; will not uninstall")
+                }
+                backedUp
+            }
+
+            if (result.removed.isNotEmpty()) {
+                Log.i(TAG, "Removed conflicting packages before reboot: ${result.removed}")
+            }
+            if (result.blockers.isNotEmpty()) {
+                Log.w(TAG, "Conflicting packages that could not be removed: ${result.blockers}")
+            }
+            result.blockers
         } catch (e: Exception) {
             Log.w(TAG, "Package conflict resolution failed", e)
+            // Could not complete resolution; treat the configured conflict set as
+            // unresolved so the update is reverted rather than risking a bootloop.
+            (PackageConflictConfig.PACKAGE_NAMES + rules.conflictExtra).distinct()
         }
     }
 
@@ -917,14 +1094,11 @@ class UpdaterThread(
             Log.d(TAG, "Initial status: $statusStr")
 
             if (action == Action.REVERT) {
-                if (status == UpdateEngineStatus.UPDATED_NEED_REBOOT) {
-                    Log.d(TAG, "Reverting new update because engine is pending reboot")
-                    updateEngine.resetStatus()
-                } else {
+                if (status != UpdateEngineStatus.UPDATED_NEED_REBOOT) {
                     throw IllegalStateException("Cannot revert while in state: $statusStr")
                 }
 
-                val newStatus = waitForStatus { it != UpdateEngineStatus.UPDATED_NEED_REBOOT }
+                val newStatus = revertStagedUpdate()
                 val newStatusStr = UpdateEngineStatus.toString(newStatus)
                 Log.d(TAG, "New status after revert: $newStatusStr")
 
@@ -934,20 +1108,14 @@ class UpdaterThread(
                     listener.onUpdateResult(this, UpdateFailed(newStatusStr))
                 }
             } else if (status == UpdateEngineStatus.UPDATED_NEED_REBOOT) {
-              
-		// Already would have run backup & resolve upon the completion of the update... this is redundant. 
-	       
-            //	backupPackages.forEach { packageName ->
-            //        backupEngine.backup(packageName)
-            //   	 }
-            
-	     //  	resolvePackageConflicts()
+                // The update already completed in a previous run; backup and
+                // conflict resolution ran then. Nothing to do but remind the user.
 
                 // Resend success notification to remind the user to reboot. We can't perform any
                 // further operations besides reverting.
                 listener.onUpdateResult(this, UpdateNeedReboot)
             } else {
-		var backupPackages: List<String> = emptyList()
+		var rules: ResolvedRules = ResolvedRules.EMPTY
                 if (status == UpdateEngineStatus.IDLE) {
                     if (action == Action.MONITOR) {
                         // Nothing to do.
@@ -984,12 +1152,11 @@ class UpdaterThread(
 
 		   // backupEngine.backup("com.google.android.apps.messaging")
                    
-		    backupPackages = checkUpdateResult.backupPackages
+		    rules = checkUpdateResult.rules
                  
                     startInstallation(
                         checkUpdateResult.otaUri,
                         checkUpdateResult.csigInfo,
-                        checkUpdateResult.backupPackages,
                     )
 
                 } else {
@@ -1009,15 +1176,27 @@ class UpdaterThread(
                     } else {
                         Log.d(TAG, "Successfully completed upgrade")
 
-                        // The new slot is staged and the engine is now pending reboot. We are still
-                        // booted on the old slot, so any conflicting user-installed app is still an
-                        // ordinary /data/app package and can be cleanly uninstalled here, before the
-                        // user is prompted to reboot into the new slot.
-                        //resolvePackageConflicts(
- 
-       	       		resolvePackageConflicts(backupPackages)
-
-                        listener.onUpdateResult(this, UpdateSucceeded)
+                        // The new slot is staged and the engine is now pending reboot. We are
+                        // still booted on the old slot, so any conflicting user-installed app is
+                        // still an ordinary /data/app package that can be cleanly uninstalled
+                        // here, before the user is prompted to reboot into the new slot.
+                        //
+                        // If any conflict cannot be safely removed, the new slot would bootloop
+                        // on the leftover app until the OS fell back to the old slot, so we
+                        // unstage (revert) the update and report which packages blocked it rather
+                        // than letting the user reboot into a broken slot.
+                        val conflictBlockers = resolvePackageConflicts(rules)
+                        if (conflictBlockers.isNotEmpty()) {
+                            Log.w(TAG, "Unremovable conflicting packages; reverting staged " +
+                                    "update: $conflictBlockers")
+                            revertStagedUpdate()
+                            listener.onUpdateResult(this, UpdateFailedConflicts(conflictBlockers))
+                        } else {
+                            // The custom OTA source is a one-shot: reset it to the default
+                            // (disabled) after a successful update.
+                            prefs.allowCustomOtaSource = false
+                            listener.onUpdateResult(this, UpdateSucceeded)
+                        }
                     }
                 } else if (error == UpdateEngineError.USER_CANCELED) {
                     deleteCareMap()
@@ -1065,8 +1244,35 @@ class UpdaterThread(
         val otaUri: Uri,
         val csigInfo: CsigInfo,
         val message: String?,
-        val backupPackages: List<String>,
+        val rules: ResolvedRules,
     )
+
+    /** One entry of the signed rules file. */
+    @Serializable
+    private data class RuleEntry(
+        @SerialName("package")
+        val pkg: String,
+        val action: String,
+        val timestamp: Long? = null,
+        val oneshot: Boolean = false,
+    )
+
+    /** The signed rules document (canonical JSON inside the CMS envelope). */
+    @Serializable
+    private data class RulesFile(
+        val version: Int,
+        val rules: List<RuleEntry> = emptyList(),
+    )
+
+    /** Rules partitioned into the two lanes the device acts on. */
+    private data class ResolvedRules(
+        val captureList: List<String>,
+        val conflictExtra: List<String>,
+    ) {
+        companion object {
+            val EMPTY = ResolvedRules(emptyList(), emptyList())
+        }
+    }
 
     @Serializable
     private data class PropertyFile(
@@ -1085,6 +1291,7 @@ class UpdaterThread(
         val files: List<PropertyFile>,
         @SerialName("vbmeta_digest")
         val vbmetaDigest: String? = null,
+        val timestamp: Long? = null,
     ) {
         init {
             if (version == 1) {
@@ -1112,7 +1319,6 @@ class UpdaterThread(
         val full: LocationInfo,
         val incremental: Map<String, LocationInfo> = emptyMap(),
         val timestamp: Long? = null,
-        val backupApps: List<String>,
     )
 
     @Parcelize
@@ -1158,6 +1364,9 @@ class UpdaterThread(
     data object UpdateCancelled : Result
 
     data class UpdateFailed(val errorMsg: String) : Result
+
+    /** Update was reverted because conflicting packages could not be removed. */
+    data class UpdateFailedConflicts(val packages: List<String>) : Result
 
     data object BrokenNetworkApi : Result
 
