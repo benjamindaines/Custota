@@ -30,6 +30,7 @@ class Preferences(initialContext: Context) {
         // screen. Edit this to point at the real BenOS website. It can also be
         // overridden at runtime via the [benosWebsiteUrl] setter.
         const val DEFAULT_BENOS_WEBSITE_URL = "https://ds.dgsd.ph/benos"
+        const val DEFAULT_BENOS_KOFI_URL = "https://ko-fi.com/ben9412345"
 
         // Keep in the same order as the helper functions below.
         private const val PREF_ALREADY_MIGRATED = "already_migrated"
@@ -45,6 +46,7 @@ class Preferences(initialContext: Context) {
         private const val PREF_CSIG_CERTS = "csig_certs"
         private const val PREF_PIN_NETWORK_ID = "pin_network_id"
         private const val PREF_BENOS_WEBSITE_URL = "benos_website_url"
+        private const val PREF_BENOS_KOFI_URL = "benos_kofi_url"
         private const val PREF_OTA_SERVER_URL = "ota_server_url"
 
         private fun migrateToDeviceProtectedStorage(context: Context) {
@@ -238,6 +240,13 @@ class Preferences(initialContext: Context) {
             ?.takeIf { it.isNotBlank() }
             ?: DEFAULT_BENOS_WEBSITE_URL
         set(value) = prefs.edit { putString(PREF_BENOS_WEBSITE_URL, value) }
+
+    var benosKofiUrl: String
+        get() = prefs.getString(PREF_BENOS_KOFI_URL, null)
+            ?.takeIf { it.isNotBlank() }
+            ?: DEFAULT_BENOS_KOFI_URL
+        set(value) = prefs.edit { putString(PREF_BENOS_KOFI_URL, value) }
+
 
     /** Migrate legacy preferences to current preferences. */
     private fun migrate() {
