@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -91,6 +92,7 @@ class UpdateMessageActivity : ComponentActivity() {
                     },
                     onCancel = { finish() },
                     onOpenWebsite = { openWebsite() },
+                    onOpenKofi = { openKofi() },
                 )
             }
         }
@@ -116,6 +118,17 @@ class UpdateMessageActivity : ComponentActivity() {
             Log.w("UpdateMessageActivity", "Failed to open website: $url", e)
         }
     }
+    
+    private fun openKofi() {
+        val url = Preferences(this).benosKofiUrl
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, url.toUri())
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.w("UpdateMessageActivity", "Failed to open website: $url", e)
+        }
+    }
+
 
     companion object {
         private const val EXTRA_MESSAGE = "message"
@@ -139,6 +152,7 @@ private fun UpdateMessageScreen(
     onInstall: () -> Unit,
     onCancel: () -> Unit,
     onOpenWebsite: () -> Unit,
+    onOpenKofi: () -> Unit,
 ) {
     val blocks = remember(message) { Markdown.parse(message) }
     val insets = WindowInsets.systemBars.asPaddingValues()
@@ -181,6 +195,16 @@ private fun UpdateMessageScreen(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+		Button(onClick = onOpenKofi, 
+		    colors = ButtonDefaults.buttonColors(
+		       // containerColor = Color(0xFF168553),
+		        containerColor = Color(0xFFa4edb2),
+		        contentColor = Color(0xFF573f45)
+		 	) 
+		    ) {
+                    Text(stringResource(R.string.update_message_open_kofi))
+                }
+                Spacer(Modifier.weight(1f)) 
                 OutlinedButton(onClick = onOpenWebsite) {
                     Text(stringResource(R.string.update_message_open_website))
                 }

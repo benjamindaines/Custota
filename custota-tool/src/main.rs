@@ -55,6 +55,7 @@ use x509_cert::{
 };
 
 const CSIG_EXT: &str = ".csig";
+const RULES_EXT: &str = ".p7m";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PropertyFile {
@@ -98,6 +99,11 @@ struct CsigInfo {
     // Version 2 only.
     #[serde(skip_serializing_if = "Option::is_none")]
     vbmeta_digest: Option<VbmetaDigest>,
+    /// UTC epoch seconds of this build, read from `.timestamp`. Signed (unlike the
+    /// descriptor's copy) so the updater can trust it for the rules window and
+    /// cross-check it against the descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -145,6 +151,96 @@ enum CsigVersion {
     Version1 = 1,
     #[value(name = "2")]
     Version2 = 2,
+}
+
+/// The lane a rule belongs to. Serialized as a lowercase string in the canonical
+/// JSON the device parses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Action {
+    /// Back up before the OS/user clears the app; never uninstall.
+    Capture,
+    /// Eligible for pre-reboot uninstall (subject to the device's system-app +
+    /// signature gates), unioned with the hard-coded floor.
+    Conflict,
+}
+
+impl Action {
+    fn as_str(self) -> &'static str {
+        match self {
+            Action::Capture => "capture",
+            Action::Conflict => "conflict",
+        }
+    }
+
+    /// Parse the author-facing action string, failing loudly on anything that
+    /// isn't a known lane (so a typo like `conlict` is a hard error, not a
+    /// silently-dropped rule).
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "capture" => Ok(Action::Capture),
+            "conflict" => Ok(Action::Conflict),
+            other => bail!("Unknown action {other:?} (expected \"capture\" or \"conflict\")"),
+        }
+    }
+}
+
+/// A single emitted rule. This is the on-wire shape the device parses; a typed
+/// `Vec<Rule>` serialized through serde is also the fix for the old "updater
+/// expected an array but got hand-built JSON" bug.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct Rule {
+    package: String,
+    action: Action,
+    /// UTC epoch seconds of the build this rule was introduced with. The updater
+    /// only runs rules whose timestamp is `<=` the destination build it is moving
+    /// to, so rules for builds beyond the destination (e.g. a pre-release branch)
+    /// are ignored on a stable install.
+    timestamp: i64,
+    /// If true, the rule fires only on the update that crosses its timestamp (a
+    /// one-time migration). If false, it fires on every update once that build has
+    /// been reached (a standing rule).
+    oneshot: bool,
+}
+
+/// The signed rules document: canonical JSON wrapped in the same CMS envelope
+/// used for csig files.
+#[derive(Clone, Debug, Serialize)]
+struct RulesFile {
+    version: u8,
+    rules: Vec<Rule>,
+}
+
+/// Author-facing TOML shape. Provenance lives in `#` comments (stripped for free
+/// by the TOML parser) and/or any extra keys such as `reason = "..."`, which
+/// serde ignores and which therefore never reach the emitted JSON.
+#[derive(Debug, Deserialize)]
+struct RulesToml {
+    #[serde(default)]
+    rule: Vec<RawRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRule {
+    package: String,
+    action: String,
+    /// Optional. Omit it (or set `timestamp = ""` / `timestamp = "auto"`) to have
+    /// the signer stamp it from the build's `.timestamp` file. An explicit integer
+    /// back-dates the rule to a specific build.
+    timestamp: Option<TimestampField>,
+    /// Optional, defaults to false (a standing rule that fires on every update once
+    /// its build is reached). Set true for a one-time migration.
+    #[serde(default)]
+    oneshot: bool,
+}
+
+/// A `timestamp` value in the source TOML: either an explicit epoch (integer) or a
+/// string sentinel (`""` or `"auto"`) meaning "fill from the build's .timestamp".
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TimestampField {
+    Epoch(i64),
+    Text(String),
 }
 
 /// View the contents of a csig file.
@@ -258,6 +354,41 @@ struct GenerateCertModule {
     cert: Vec<PathBuf>,
 }
 
+/// Sign a remote rules file.
+///
+/// Parses a hand-edited `rules.toml`, validates it, serializes the rules as
+/// canonical JSON, and wraps them in the same CMS envelope used for csig files.
+/// The signing key is the bespoke BenOS rules key, independent of the OTA and
+/// platform keys.
+#[derive(Debug, Parser)]
+struct SignRules {
+    /// Input path for the rules TOML file.
+    #[arg(short, long, value_parser)]
+    input: PathBuf,
+
+    /// Output path for the signed rules file.
+    ///
+    /// Defaults to <input>.p7m.
+    #[arg(short, long, value_parser)]
+    output: Option<PathBuf>,
+
+    /// Path to private key for signing the rules.
+    #[arg(short, long, value_parser)]
+    key: PathBuf,
+
+    /// Environment variable containing the private key passphrase.
+    #[arg(long, value_parser, group = "passphrase")]
+    passphrase_env_var: Option<OsString>,
+
+    /// Text file containing the private key passphrase.
+    #[arg(long, value_parser, group = "passphrase")]
+    passphrase_file: Option<PathBuf>,
+
+    /// Path to certificate for signing the rules.
+    #[arg(short, long, value_parser)]
+    cert: PathBuf,
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -265,6 +396,7 @@ enum Command {
     GenCsig(GenerateCsig),
     GenUpdateInfo(GenerateUpdateInfo),
     GenCertModule(GenerateCertModule),
+    SignRules(SignRules),
 }
 
 #[derive(Debug, Parser)]
@@ -691,6 +823,7 @@ fn subcommand_gen_csig(args: &GenerateCsig, cancel_signal: &AtomicBool) -> Resul
         version: args.csig_version,
         files: digested_pfs,
         vbmeta_digest,
+        timestamp: read_dot_timestamp()?,
     };
     let csig_info_raw = serde_json::to_string(&csig_info)?;
 
@@ -759,7 +892,7 @@ fn subcommand_gen_update_info(args: &GenerateUpdateInfo) -> Result<()> {
     update_info.timestamp = fs::read_to_string(".timestamp")?
         .trim()
         .parse::<i64>()?;
-
+    
 //        .duration_since(UNIX_EPOCH)
 //        .context("System time is before the Unix epoch")?
 //        .as_secs() as i64;
@@ -788,6 +921,208 @@ fn subcommand_gen_update_info(args: &GenerateUpdateInfo) -> Result<()> {
     } else {
         info!("Updated: {:?}", args.file);
     }
+
+    Ok(())
+}
+
+/// Loosely validate an Android package name so obvious typos and garbage fail at
+/// author time rather than silently shipping. Requires at least two dot-separated
+/// segments, each starting with a letter or underscore and otherwise alphanumeric
+/// or underscore.
+fn is_valid_package_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    let segments: Vec<&str> = name.split('.').collect();
+    if segments.len() < 2 {
+        return false;
+    }
+
+    segments.iter().all(|seg| {
+        let mut chars = seg.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Validate the parsed TOML and build a canonical, deduplicated, sorted
+/// `Vec<Rule>`. Hard errors on unknown actions and malformed package names;
+/// warns (but continues) on exact duplicates and on a package straddling both
+/// lanes.
+/// Read the build's UTC epoch-seconds timestamp from the `.timestamp` file, used to
+/// stamp rules that don't carry an explicit timestamp. Returns None if the file is
+/// absent; errors if it is present but unparseable.
+fn read_dot_timestamp() -> Result<Option<i64>> {
+    match fs::read_to_string(".timestamp") {
+        Ok(s) => Ok(Some(
+            s.trim()
+                .parse::<i64>()
+                .context("Invalid .timestamp contents (expected an integer epoch)")?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e).context("Failed to read .timestamp")),
+    }
+}
+
+/// Resolve a rule's timestamp: an explicit epoch is used as-is; an omitted value or
+/// the string sentinels "" / "auto" are filled from the build's `.timestamp`.
+fn resolve_timestamp(
+    package: &str,
+    field: &Option<TimestampField>,
+    default_timestamp: Option<i64>,
+) -> Result<i64> {
+    let autofill = || {
+        default_timestamp.ok_or_else(|| {
+            anyhow!(
+                "Rule for {package:?} needs an autofilled timestamp but no .timestamp \
+                 file was found; add `timestamp = <epoch>` or create a .timestamp file"
+            )
+        })
+    };
+
+    let ts = match field {
+        None => autofill()?,
+        Some(TimestampField::Epoch(n)) => *n,
+        Some(TimestampField::Text(s)) => {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+                autofill()?
+            } else {
+                s.parse::<i64>()
+                    .with_context(|| anyhow!("Rule for {package:?} has an invalid timestamp {s:?}"))?
+            }
+        }
+    };
+
+    if ts < 0 {
+        bail!("Rule for {package:?} has a negative timestamp: {ts}");
+    }
+
+    Ok(ts)
+}
+
+fn validate_and_build_rules(
+    toml_doc: &RulesToml,
+    default_timestamp: Option<i64>,
+) -> Result<Vec<Rule>> {
+    let mut rules = Vec::with_capacity(toml_doc.rule.len());
+    let mut seen: HashSet<(String, Action)> = HashSet::new();
+    let mut capture_pkgs: HashSet<&str> = HashSet::new();
+    let mut conflict_pkgs: HashSet<&str> = HashSet::new();
+
+    for raw in &toml_doc.rule {
+        let action = Action::parse(&raw.action)
+            .with_context(|| anyhow!("Invalid rule for package {:?}", raw.package))?;
+
+        if !is_valid_package_name(&raw.package) {
+            bail!("Malformed package name: {:?}", raw.package);
+        }
+
+        let timestamp = resolve_timestamp(&raw.package, &raw.timestamp, default_timestamp)?;
+
+        if !seen.insert((raw.package.clone(), action)) {
+            warn!(
+                "Ignoring duplicate rule: {} ({})",
+                raw.package,
+                action.as_str(),
+            );
+            continue;
+        }
+
+        match action {
+            Action::Capture => {
+                capture_pkgs.insert(raw.package.as_str());
+            }
+            Action::Conflict => {
+                conflict_pkgs.insert(raw.package.as_str());
+            }
+        }
+
+        rules.push(Rule {
+            package: raw.package.clone(),
+            action,
+            timestamp,
+            oneshot: raw.oneshot,
+        });
+    }
+
+    for pkg in capture_pkgs.intersection(&conflict_pkgs) {
+        warn!("Package {pkg:?} appears in both the capture and conflict lanes");
+    }
+
+    // Canonical ordering: deterministic output regardless of source ordering, so
+    // the signed artifact is reproducible and diffable.
+    rules.sort();
+
+    Ok(rules)
+}
+
+fn subcommand_sign_rules(args: &SignRules) -> Result<()> {
+    let passphrase_source = if let Some(v) = &args.passphrase_env_var {
+        PassphraseSource::EnvVar(v.clone())
+    } else if let Some(p) = &args.passphrase_file {
+        PassphraseSource::File(p.clone())
+    } else {
+        PassphraseSource::Prompt(format!("Enter passphrase for {:?}: ", args.key))
+    };
+
+    let signing_private_key = crypto::read_pem_key_file(&args.key, &passphrase_source)
+        .with_context(|| anyhow!("Failed to load key: {:?}", args.key))?;
+    let signing_cert = crypto::read_pem_cert_file(&args.cert)
+        .with_context(|| anyhow!("Failed to load certificate: {:?}", args.cert))?;
+
+    if !crypto::cert_matches_key(
+        &signing_cert,
+        &RsaSigningKey::Internal(signing_private_key.clone()),
+    )? {
+        bail!(
+            "Private key {:?} does not match certificate {:?}",
+            args.key,
+            args.cert,
+        );
+    }
+
+    let toml_raw = fs::read_to_string(&args.input)
+        .with_context(|| anyhow!("Failed to read rules file: {:?}", args.input))?;
+    let toml_doc: RulesToml = toml::from_str(&toml_raw)
+        .with_context(|| anyhow!("Failed to parse rules TOML: {:?}", args.input))?;
+
+    let default_timestamp = read_dot_timestamp()?;
+    let rules = validate_and_build_rules(&toml_doc, default_timestamp)
+        .with_context(|| anyhow!("Rules validation failed: {:?}", args.input))?;
+
+    let capture_count = rules.iter().filter(|r| r.action == Action::Capture).count();
+    let conflict_count = rules.len() - capture_count;
+    info!(
+        "Validated {} rule(s): {capture_count} capture, {conflict_count} conflict",
+        rules.len(),
+    );
+
+    let rules_file = RulesFile { version: 1, rules };
+
+    // Canonical JSON from a typed value (no hand-built JSON).
+    let rules_json = serde_json::to_vec(&rules_file)?;
+
+    let signature = sign_cms_inline(&signing_private_key, &signing_cert, &rules_json)?;
+    let signature_der = signature.to_der()?;
+
+    let output = args.output.as_ref().map_or_else(
+        || {
+            let mut s = args.input.clone().into_os_string();
+            s.push(RULES_EXT);
+            Cow::Owned(PathBuf::from(s))
+        },
+        Cow::Borrowed,
+    );
+
+    fs::write(output.as_ref(), signature_der)
+        .with_context(|| anyhow!("Failed to create file: {output:?}"))?;
+
+    info!("Wrote: {output:?}");
 
     Ok(())
 }
@@ -922,5 +1257,6 @@ fn main() -> Result<()> {
         Command::GenCsig(args) => subcommand_gen_csig(&args, &cancel_signal),
         Command::GenUpdateInfo(args) => subcommand_gen_update_info(&args),
         Command::GenCertModule(args) => subcommand_gen_cert_module(&args),
+        Command::SignRules(args) => subcommand_sign_rules(&args),
     }
 }

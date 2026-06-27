@@ -124,5 +124,6 @@
     <!-- Update message screen -->
     <string name="update_message_title">Update beschikbaar</string>
     <string name="update_message_dont_install">Niet installeren</string>
-    <string name="update_message_open_website">Open BenOS-website</string>
+    <string name="update_message_open_website">BenOS website</string>
+    <string name="update_message_open_kofi">Ko-Fi Page</string>
 </resources>

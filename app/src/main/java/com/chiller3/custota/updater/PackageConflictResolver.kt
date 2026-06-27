@@ -33,39 +33,76 @@ class PackageConflictResolver(private val context: Context) {
     private val packageManager = context.packageManager
 
  
-   @JvmOverloads     
+    /**
+     * Evaluate each candidate package and uninstall the ones that are genuine
+     * conflicts (installed, non-system, untrusted signature). A non-null
+     * [onBeforeUninstall] is invoked immediately before each uninstall; returning
+     * false (e.g. because a pre-uninstall backup could not be made) leaves the app
+     * in place.
+     *
+     * Returns the packages actually removed and the "blockers": conflicts that
+     * were NOT removed, whether because the hook declined or the uninstall failed.
+     * The caller uses a non-empty blocker list to revert a staged update, since a
+     * leftover conflicting app would bootloop the new slot.
+     */
+    @JvmOverloads
     fun resolveConflicts(
         packageNames: List<String> = PackageConflictConfig.PACKAGE_NAMES,
-    ): List<String> {
+        onBeforeUninstall: ((String) -> Boolean)? = null,
+    ): ConflictResult {
         if (packageNames.isEmpty()) {
             Log.d(TAG, "No packages configured for conflict resolution")
-            return emptyList()
+            return ConflictResult(emptyList(), emptyList())
         }
 
         val trustedCerts = collectTrustedCertificates()
         if (trustedCerts.rawCerts.isEmpty() && trustedCerts.sha256Digests.isEmpty()) {
-            // Fail safe: if we cannot determine any trusted certificate, do nothing rather than
-            // risk uninstalling a legitimately-signed app.
+            // Fail safe: if we cannot determine any trusted certificate, do nothing
+            // rather than risk uninstalling a legitimately-signed app.
             Log.w(TAG, "No trusted certificates available; skipping conflict resolution")
-            return emptyList()
+            return ConflictResult(emptyList(), emptyList())
         }
 
         val removed = mutableListOf<String>()
+        val blockers = mutableListOf<String>()
 
         for (packageName in packageNames) {
             try {
-                if (shouldUninstall(packageName, trustedCerts) && uninstall(packageName)) {
+                if (!shouldUninstall(packageName, trustedCerts)) {
+                    continue
+                }
+
+                // Back up before removing. If the hook declines (e.g. the backup
+                // could not be made), leave the app in place; it becomes a blocker.
+                if (onBeforeUninstall != null && !onBeforeUninstall(packageName)) {
+                    Log.w(TAG, "Not uninstalling $packageName: pre-uninstall backup failed")
+                    blockers.add(packageName)
+                    continue
+                }
+
+                if (uninstall(packageName)) {
                     removed.add(packageName)
+                } else {
+                    Log.w(TAG, "Failed to uninstall conflicting package: $packageName")
+                    blockers.add(packageName)
                 }
             } catch (e: Exception) {
-                // Never let a single package failure abort the rest or the update flow.
+                // A package we could not even evaluate is treated as a blocker so the
+                // update is reverted rather than risking a leftover conflict.
                 Log.w(TAG, "Error while evaluating $packageName for conflict resolution", e)
+                blockers.add(packageName)
             }
         }
 
-        Log.d(TAG, "Conflict resolution removed: $removed")
-        return removed
+        Log.d(TAG, "Conflict resolution removed=$removed blockers=$blockers")
+        return ConflictResult(removed, blockers)
     }
+
+    /** Result of [resolveConflicts]: packages removed, and conflicts left in place. */
+    data class ConflictResult(
+        val removed: List<String>,
+        val blockers: List<String>,
+    )
 
     private fun shouldUninstall(packageName: String, trustedCerts: TrustedCertificates): Boolean {
         val appInfo = try {

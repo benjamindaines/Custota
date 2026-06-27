@@ -238,6 +238,10 @@ dependencies {
     implementation(libs.material)
     implementation(libs.protobuf.javalite)
     debugImplementation(libs.androidx.compose.ui.tooling)
+    implementation(libs.commons.compress)
+    implementation(libs.security.crypto)
+    implementation(libs.zstd.jni)
+    implementation(libs.commons.io)
 }
 
 val archive = tasks.register("archive") {
